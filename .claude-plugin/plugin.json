@@ -1,0 +1,8 @@
+{
+  "name": "claude-usage",
+  "version": "0.1.0",
+  "description": "Check Claude Max usage across multiple accounts",
+  "author": {
+    "name": "Tom"
+  }
+}

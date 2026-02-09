@@ -76,8 +76,14 @@ def load_cookies(account_id: str) -> list[dict] | None:
 # ── Setup: interactive login + cookie export ─────────────────────────────────
 
 async def setup_account(account_id: str, accounts: dict):
+    import shutil
+
     acct = accounts[account_id]
     profile_dir = PROFILES_DIR / f"account-{account_id}"
+    # Wipe existing profile to prevent stale sessions from auto-logging in
+    # as the wrong account
+    if profile_dir.exists():
+        shutil.rmtree(profile_dir)
     profile_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n--- Setting up: {acct['label']} ---")
@@ -97,7 +103,8 @@ async def setup_account(account_id: str, accounts: dict):
         print("Waiting for login (up to 5 minutes)...")
         try:
             await page.wait_for_url(
-                lambda url: "/chat" in url or url.rstrip("/") == "https://claude.ai",
+                lambda url: any(p in url for p in ("/chat", "/new", "/recents"))
+                or url.rstrip("/") == "https://claude.ai",
                 timeout=300_000,
             )
             print(f"Logged in successfully: {acct['label']}")
@@ -206,11 +213,18 @@ async def discover_all(accounts: dict):
     print("\nYou can now use 'claude-usage check' for fast usage checks.")
 
 
-# ── Check: fast httpx-based usage fetch ──────────────────────────────────────
+# ── Check: fast curl_cffi-based usage fetch ──────────────────────────────────
 
-async def check_fast(account_id: str, accounts: dict) -> dict:
-    """Check usage via direct HTTP calls (no browser)."""
-    import httpx
+# Endpoints to fetch per org (relative to /api/organizations/{org_id}/)
+USAGE_ENDPOINTS = [
+    "usage",
+    "subscription_details",
+]
+
+
+def check_fast_sync(account_id: str, accounts: dict) -> dict:
+    """Check usage via direct HTTP calls with curl_cffi (no browser)."""
+    from curl_cffi import requests as curl_requests
 
     acct = accounts[account_id]
     result = {
@@ -226,54 +240,60 @@ async def check_fast(account_id: str, accounts: dict) -> dict:
         result["error"] = f"No cookies found. Run: claude-usage setup -a {account_id}"
         return result
 
-    endpoints = []
-    if ENDPOINTS_FILE.exists():
-        endpoints = json.loads(ENDPOINTS_FILE.read_text())
+    cookie_dict = {c["name"]: c["value"] for c in cookies}
 
-    if not endpoints:
-        result["error"] = "No endpoints discovered. Run: claude-usage discover"
+    def get(url):
+        return curl_requests.get(url, cookies=cookie_dict, impersonate="chrome")
+
+    # Step 1: get org UUID via bootstrap
+    try:
+        resp = get("https://claude.ai/api/bootstrap")
+    except Exception as e:
+        result["error"] = f"Network error: {e}"
         return result
 
-    # Build cookie jar from saved cookies
-    cookie_jar = httpx.Cookies()
-    for c in cookies:
-        cookie_jar.set(c["name"], c["value"], domain=c.get("domain", "claude.ai"))
+    if resp.status_code in (401, 403):
+        result["error"] = f"Session expired. Run: claude-usage setup -a {account_id}"
+        return result
 
-    async with httpx.AsyncClient(
-        cookies=cookie_jar,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-            "Accept": "application/json",
-            "Referer": "https://claude.ai/settings/usage",
-        },
-        follow_redirects=True,
-        timeout=15.0,
-    ) as client:
-        for ep in endpoints:
-            url = ep["url"]
-            try:
-                resp = await client.get(url)
+    try:
+        bootstrap = resp.json()
+    except Exception:
+        result["error"] = f"Unexpected response: {resp.text[:200]}"
+        return result
 
-                if resp.status_code in (401, 403):
-                    result["error"] = f"Session expired. Run: claude-usage setup -a {account_id}"
-                    return result
+    try:
+        org_id = bootstrap["account"]["memberships"][0]["organization"]["uuid"]
+    except (KeyError, IndexError):
+        result["error"] = f"No organization found. Run: claude-usage setup -a {account_id}"
+        return result
 
-                if resp.status_code == 200:
-                    try:
-                        data = resp.json()
-                    except Exception:
-                        data = resp.text[:500]
-                    result["api_data"].append({
-                        "url": url,
-                        "status": resp.status_code,
-                        "data": data,
-                    })
-            except httpx.HTTPError as e:
+    # Step 2: fetch usage endpoints
+    for ep_path in USAGE_ENDPOINTS:
+        url = f"https://claude.ai/api/organizations/{org_id}/{ep_path}"
+        try:
+            resp = get(url)
+
+            if resp.status_code in (401, 403):
+                result["error"] = f"Session expired. Run: claude-usage setup -a {account_id}"
+                return result
+
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = resp.text[:500]
                 result["api_data"].append({
                     "url": url,
-                    "status": "error",
-                    "data": str(e),
+                    "status": resp.status_code,
+                    "data": data,
                 })
+        except Exception as e:
+            result["api_data"].append({
+                "url": url,
+                "status": "error",
+                "data": str(e),
+            })
 
     return result
 
@@ -358,26 +378,199 @@ async def check_accounts(account_ids: list[str], accounts: dict, visible: bool =
     results = []
 
     if visible:
-        # Browser mode: sequential (can't run multiple Chromium contexts well in parallel)
+        # Browser mode: sequential
         for aid in account_ids:
             print(f"Checking {accounts[aid]['label']} (browser)...", file=sys.stderr)
             r = await check_browser(aid, accounts, headless=False)
             results.append(r)
     else:
-        # Fast mode: parallel httpx calls
-        tasks = []
+        # Fast mode: curl_cffi (sync, but each call is <1s)
         for aid in account_ids:
             print(f"Checking {accounts[aid]['label']}...", file=sys.stderr)
-            tasks.append(check_fast(aid, accounts))
-        results = await asyncio.gather(*tasks)
-        results = list(results)
+            r = check_fast_sync(aid, accounts)
+            results.append(r)
 
     return results
 
 
 # ── Output formatting ────────────────────────────────────────────────────────
 
-def format_results(results: list[dict]):
+def _parse_reset_time(resets_at: str | None) -> datetime | None:
+    if not resets_at:
+        return None
+    from datetime import timezone
+    # Handle ISO format with timezone
+    s = resets_at.replace("+00:00", "+0000").replace("Z", "+0000")
+    try:
+        # Python 3.11+ handles this natively
+        return datetime.fromisoformat(resets_at)
+    except Exception:
+        return None
+
+
+def _time_remaining(dt: datetime | None) -> str:
+    if not dt:
+        return "-"
+    from datetime import timezone
+    now = datetime.now(timezone.utc)
+    # Make dt timezone-aware if it isn't
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    delta = dt - now
+    total_secs = int(delta.total_seconds())
+    if total_secs <= 0:
+        return "now"
+    hours, remainder = divmod(total_secs, 3600)
+    minutes = remainder // 60
+    if hours >= 24:
+        days = hours // 24
+        hours = hours % 24
+        return f"{days}d {hours}h"
+    return f"{hours}h {minutes}m"
+
+
+def _pace_indicator(utilization: float, resets_at: str | None, window_hours: float) -> str:
+    """Compare usage % to % of window elapsed. Returns a pace indicator."""
+    from datetime import timezone
+
+    if utilization == 0:
+        return ""
+    if not resets_at:
+        return ""
+
+    reset_dt = _parse_reset_time(resets_at)
+    if not reset_dt:
+        return ""
+
+    now = datetime.now(timezone.utc)
+    if reset_dt.tzinfo is None:
+        reset_dt = reset_dt.replace(tzinfo=timezone.utc)
+
+    secs_remaining = (reset_dt - now).total_seconds()
+    if secs_remaining <= 0:
+        return ""
+
+    window_secs = window_hours * 3600
+    secs_elapsed = window_secs - secs_remaining
+    if secs_elapsed <= 0:
+        return ""
+
+    period_pct = (secs_elapsed / window_secs) * 100
+    if period_pct < 1:
+        return ""
+
+    # pace = how fast you're burning relative to the clock
+    # >1 means you'll hit the limit before the window resets
+    pace = utilization / period_pct
+
+    if pace >= 2.0:
+        return "!!!"  # way over pace
+    elif pace >= 1.2:
+        return "! "   # over pace
+    elif pace >= 0.8:
+        return "~ "   # roughly on pace
+    else:
+        return "ok"   # under pace
+
+
+def _billing_info(sub_data: dict) -> tuple[str, str]:
+    """Return (next_billing_str, days_until_str)."""
+    from datetime import timezone
+    ncd = sub_data.get("next_charge_date")
+    if not ncd:
+        return ("-", "-")
+    try:
+        next_date = datetime.strptime(ncd, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        days = (next_date - now).days
+        return (ncd, f"{days}d")
+    except Exception:
+        return (ncd, "?")
+
+
+def format_summary(results: list[dict]):
+    """Print a compact summary table."""
+    from datetime import timezone
+
+    rows = []
+    for r in results:
+        label = r["label"].split("@")[0]  # just the username part
+
+        if r.get("error"):
+            rows.append({"label": label, "error": r["error"]})
+            continue
+
+        usage_data = None
+        sub_data = None
+        for entry in r.get("api_data", []):
+            data = entry.get("data", {})
+            if not isinstance(data, dict):
+                continue
+            if "five_hour" in data:
+                usage_data = data
+            elif "next_charge_date" in data:
+                sub_data = data
+
+        if not usage_data:
+            rows.append({"label": label, "error": "No usage data"})
+            continue
+
+        five = usage_data.get("five_hour") or {}
+        week = usage_data.get("seven_day") or {}
+        sonnet = usage_data.get("seven_day_sonnet") or {}
+
+        five_pct = five.get("utilization", 0)
+        week_pct = week.get("utilization", 0)
+        sonnet_pct = sonnet.get("utilization", 0)
+
+        five_reset = _time_remaining(_parse_reset_time(five.get("resets_at")))
+        week_reset = _time_remaining(_parse_reset_time(week.get("resets_at")))
+
+        week_pace = _pace_indicator(week_pct, week.get("resets_at"), 7 * 24)
+        five_pace = _pace_indicator(five_pct, five.get("resets_at"), 5)
+
+        next_bill, days_until = ("-", "-")
+        if sub_data:
+            next_bill, days_until = _billing_info(sub_data)
+
+        rows.append({
+            "label": label,
+            "five_pct": five_pct, "five_reset": five_reset, "five_pace": five_pace,
+            "week_pct": week_pct, "week_reset": week_reset, "week_pace": week_pace,
+            "sonnet_pct": sonnet_pct,
+            "next_bill": next_bill, "days_until": days_until,
+        })
+
+    # Print table
+    print()
+    hdr = f"{'Account':<20s} {'5hr':>5s} {'resets':>7s} {'7day':>5s} {'resets':>7s} {'pace':>4s} {'sonnet':>6s} {'billing':>10s} {'in':>4s}"
+    print(hdr)
+    print("-" * len(hdr))
+
+    for row in rows:
+        if "error" in row:
+            print(f"{row['label']:<20s} ERROR: {row['error']}")
+            continue
+
+        print(
+            f"{row['label']:<20s}"
+            f" {row['five_pct']:>4.0f}%"
+            f" {row['five_reset']:>7s}"
+            f" {row['week_pct']:>4.0f}%"
+            f" {row['week_reset']:>7s}"
+            f" {row['week_pace']:>4s}"
+            f" {row['sonnet_pct']:>5.0f}%"
+            f" {row['next_bill']:>10s}"
+            f" {row['days_until']:>4s}"
+        )
+
+    print()
+    print("Pace: ok = under pace, ~ = on pace, ! = over pace, !!! = way over")
+    print()
+
+
+def format_detail(results: list[dict]):
+    """Print detailed API response data."""
     divider = "=" * 60
 
     for r in results:
@@ -413,14 +606,6 @@ def format_results(results: list[dict]):
                 else:
                     print(f"    {data}")
 
-        if r.get("page_text"):
-            print(f"\n  Page content:")
-            lines = [l.strip() for l in r["page_text"].splitlines() if l.strip()]
-            for line in lines[:40]:
-                print(f"    {line}")
-            if len(lines) > 40:
-                print(f"    ... ({len(lines) - 40} more lines)")
-
     print()
 
 
@@ -451,6 +636,7 @@ commands:
     sp_check.add_argument("--account", "-a", help="Account number or name (default: all)")
     sp_check.add_argument("--visible", action="store_true", help="Use browser instead of fast HTTP mode")
     sp_check.add_argument("--json", action="store_true", help="Output raw JSON")
+    sp_check.add_argument("--detail", "-d", action="store_true", help="Show detailed API responses")
 
     args = parser.parse_args()
     accounts = load_accounts()
@@ -486,8 +672,10 @@ commands:
 
         if args.json:
             print(json.dumps(results, indent=2, default=str))
+        elif args.detail:
+            format_detail(results)
         else:
-            format_results(results)
+            format_summary(results)
 
 
 if __name__ == "__main__":

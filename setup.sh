@@ -22,7 +22,7 @@ fi
 source .venv/bin/activate
 
 echo "Installing dependencies..."
-pip install --quiet playwright httpx
+pip install --quiet playwright httpx curl_cffi
 
 echo "Installing Chromium browser for Playwright..."
 playwright install chromium
