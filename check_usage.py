@@ -278,16 +278,15 @@ def check_fast_sync(account_id: str, accounts: dict) -> dict:
                 result["error"] = f"Session expired. Run: claude-usage setup -a {account_id}"
                 return result
 
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                except Exception:
-                    data = resp.text[:500]
-                result["api_data"].append({
-                    "url": url,
-                    "status": resp.status_code,
-                    "data": data,
-                })
+            try:
+                data = resp.json()
+            except Exception:
+                data = resp.text[:500]
+            result["api_data"].append({
+                "url": url,
+                "status": resp.status_code,
+                "data": data,
+            })
         except Exception as e:
             result["api_data"].append({
                 "url": url,
@@ -502,7 +501,9 @@ def format_summary(results: list[dict]):
 
         usage_data = None
         sub_data = None
+        usage_status = None
         for entry in r.get("api_data", []):
+            status = entry.get("status")
             data = entry.get("data", {})
             if not isinstance(data, dict):
                 continue
@@ -510,9 +511,15 @@ def format_summary(results: list[dict]):
                 usage_data = data
             elif "next_charge_date" in data:
                 sub_data = data
+            elif "usage" in entry.get("url", ""):
+                usage_status = status
 
         if not usage_data:
-            rows.append({"label": label, "error": "No usage data"})
+            if usage_status == 429:
+                msg = "Usage API rate limited (429)"
+            else:
+                msg = "No usage data"
+            rows.append({"label": label, "error": msg})
             continue
 
         five = usage_data.get("five_hour") or {}

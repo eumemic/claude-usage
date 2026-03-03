@@ -4,12 +4,12 @@ description: >
   This skill should be used when the user asks "check my usage", "how's my Claude usage",
   "am I running low", "which account has capacity", "check usage", "how much usage do I have left",
   "usage report", "which account should I use", mentions Claude Max rate limits, or asks about
-  any of their Claude accounts (eumemic, pelotom, thomasmcrockett).
+  any of their Claude Max accounts.
 ---
 
 # Claude Max Usage Checker
 
-Check usage across 3 Claude Max accounts (eumemic, pelotom, thomasmcrockett) and report results in plain language.
+Check usage across all configured Claude Max accounts and report results in plain language.
 
 ## Checking Usage
 
@@ -19,9 +19,9 @@ Run this command to get structured JSON data for all accounts:
 ~/code/claude-usage/claude-usage check --json 2>/dev/null
 ```
 
-Parse the JSON output and present a human-readable summary. Do not show raw JSON to the user.
+Parse the JSON output and present a human-readable summary. Do not show raw JSON to the user. The number of accounts is determined by the output — do not assume a fixed count.
 
-To check a single account by number (1, 2, 3) or name:
+To check a single account by number or name:
 
 ```bash
 ~/code/claude-usage/claude-usage check --json -a pelotom 2>/dev/null
@@ -68,32 +68,30 @@ Run: ~/code/claude-usage/claude-usage setup -a {account_number}
 
 This opens a browser for Google OAuth re-login. The user must run this in their own terminal — it cannot be run from within Claude Code.
 
-## Account Setup
+## Account Management
 
-Three accounts are configured:
+Accounts are configured in `~/code/claude-usage/accounts.json`. To see which accounts exist:
 
-| # | Name | Email |
-|---|------|-------|
-| 1 | eumemic | eumemic@gmail.com |
-| 2 | pelotom | pelotom@gmail.com |
-| 3 | thomasmcrockett | thomasmcrockett@gmail.com |
+```bash
+cat ~/code/claude-usage/accounts.json
+```
 
 ### First-time setup or session refresh
 
 ```bash
 ~/code/claude-usage/claude-usage setup          # all accounts
-~/code/claude-usage/claude-usage setup -a 2     # just pelotom
+~/code/claude-usage/claude-usage setup -a 2     # just account #2
 ```
 
 Setup opens a Playwright browser for each account. The user logs in via Google OAuth. Cookies are exported to `~/code/claude-usage/profiles/account-{N}/cookies.json`. Sessions typically last weeks before expiring.
 
 ## Example Response Style
 
-When the user asks "how's my usage?", respond like:
+When the user asks "how's my usage?", respond conversationally:
 
-> All three accounts are active. **pelotom** is at 57% of the weekly limit with 22 hours until reset — comfortable pace. **thomasmcrockett** has barely been touched (3% weekly). **eumemic** is completely fresh. I'd use eumemic or thomasmcrockett next.
+> **pelotom** is at 57% of the weekly limit with 22 hours until reset — comfortable pace. **thomasmcrockett** has barely been touched (3% weekly). **eumemic** is completely fresh. I'd use eumemic or thomasmcrockett next.
 
-Keep it conversational. Lead with the most important information (which accounts are getting close to limits). Only mention billing dates if the user asks.
+Lead with the most important information (which accounts are getting close to limits). Only mention billing dates if the user asks.
 
 ## Additional Resources
 
