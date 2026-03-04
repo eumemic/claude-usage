@@ -3,8 +3,8 @@ name: usage-checker
 description: >
   This skill should be used when the user asks "check my usage", "how's my Claude usage",
   "am I running low", "which account has capacity", "check usage", "how much usage do I have left",
-  "usage report", "which account should I use", mentions Claude Max rate limits, or asks about
-  any of their Claude Max accounts.
+  "usage report", "burn rate", "how fast am I burning", "which account should I use",
+  mentions Claude Max rate limits, or asks about any of their Claude Max accounts.
 ---
 
 # Claude Max Usage Checker
@@ -92,6 +92,59 @@ When the user asks "how's my usage?", respond conversationally:
 > **pelotom** is at 57% of the weekly limit with 22 hours until reset — comfortable pace. **thomasmcrockett** has barely been touched (3% weekly). **eumemic** is completely fresh. I'd use eumemic or thomasmcrockett next.
 
 Lead with the most important information (which accounts are getting close to limits). Only mention billing dates if the user asks.
+
+## Burn Rate Analysis
+
+For trend analysis over time, use the `report` command:
+
+```bash
+~/code/claude-usage/claude-usage report 2>/dev/null
+~/code/claude-usage/claude-usage report --json 2>/dev/null
+~/code/claude-usage/claude-usage report --hours 6 -a eumemic 2>/dev/null
+```
+
+This reads from JSONL history (`~/code/claude-usage/data/usage-history.jsonl`) populated by the `track` command. It computes burn rates via linear regression and projects ETAs to limit.
+
+If the user asks about burn rate and there's no history data, tell them to set up tracking:
+
+```
+# Record snapshots (run via cron every 15 minutes):
+~/code/claude-usage/claude-usage track
+
+# Cron entry:
+# */15 * * * * ~/code/claude-usage/claude-usage track 2>>~/code/claude-usage/data/track-errors.log
+```
+
+When presenting report data, focus on:
+- Which accounts are burning fastest (highest slope_per_hour)
+- Which will hit the limit before reset (will_hit_limit flag)
+- The recommendation for which account to use next
+
+## Pool Health Analysis
+
+The `report` command includes pool-level analysis that accounts for token rotation.
+
+### Key Concepts
+
+- **Pool headroom**: Total remaining capacity across all uncapped accounts. E.g., if 4 accounts are at 20%, 50%, 80%, 100%, headroom = 80+50+20 = 150%.
+- **Active burn rate**: The rate of the currently-burning account (highest slope among uncapped). Only one account burns at a time due to rotation.
+- **Pool runway**: headroom / active_burn_rate. How long until ALL accounts are capped if burning continues at the current rate with sequential rotation.
+- **Safe if reset comes first**: If any capped account resets before the pool runway expires, capacity is replenished.
+
+### Alert Levels
+
+- **ok**: Multiple accounts have headroom, runway is comfortable
+- **warning**: Down to 1-2 accounts, or both remaining are above 80%
+- **critical**: All accounts capped, or last account hits cap in <2h
+
+### Example Interpretation
+
+> Pool headroom: 150% across 3 accounts
+> Active burn: +2.5/hr (sequential rotation)
+> Runway: ~60h until all accounts capped
+> Next reset: 18h
+
+This means: at 2.5%/hr, 150% of headroom lasts 60 hours. The first account resets in 18 hours, well before exhaustion. The pool is healthy.
 
 ## Additional Resources
 

@@ -1,6 +1,6 @@
 {
   "name": "claude-usage",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Check Claude Max usage across multiple accounts",
   "author": {
     "name": "Tom"

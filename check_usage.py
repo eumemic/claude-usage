@@ -15,13 +15,18 @@ Usage:
     claude-usage check -a 2             # Fast check, one account
     claude-usage check --json           # Raw JSON output
     claude-usage check --visible        # Browser fallback (if cookies expired)
+    claude-usage track                  # Append snapshot to history (for cron)
+    claude-usage report                 # Burn rate analysis (last 24h)
+    claude-usage report --hours 6       # Shorter lookback window
+    claude-usage report --json          # JSON output
+    claude-usage report -a eumemic      # Filter to one account
 """
 
 import argparse
 import asyncio
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from playwright.async_api import async_playwright
@@ -30,6 +35,7 @@ SCRIPT_DIR = Path(__file__).parent
 PROFILES_DIR = SCRIPT_DIR / "profiles"
 CONFIG_FILE = SCRIPT_DIR / "accounts.json"
 ENDPOINTS_FILE = SCRIPT_DIR / "endpoints.json"
+HISTORY_FILE = SCRIPT_DIR / "data" / "usage-history.jsonl"
 
 DEFAULT_ACCOUNTS = {
     "1": {"name": "eumemic", "label": "eumemic@gmail.com"},
@@ -161,7 +167,10 @@ async def discover_endpoints(account_id: str, accounts: dict):
                         "url": url,
                         "method": response.request.method,
                         "status": response.status,
-                        "sample_keys": list(body.keys()) if isinstance(body, dict) else f"[array:{len(body)}]",
+                        "sample_keys": (
+                            list(body.keys()) if isinstance(body, dict)
+                            else f"[array:{len(body)}]"
+                        ),
                     })
                 except Exception:
                     pass
@@ -373,7 +382,9 @@ async def check_browser(account_id: str, accounts: dict, headless: bool = True) 
     return result
 
 
-async def check_accounts(account_ids: list[str], accounts: dict, visible: bool = False) -> list[dict]:
+async def check_accounts(
+    account_ids: list[str], accounts: dict, visible: bool = False,
+) -> list[dict]:
     results = []
 
     if visible:
@@ -397,11 +408,7 @@ async def check_accounts(account_ids: list[str], accounts: dict, visible: bool =
 def _parse_reset_time(resets_at: str | None) -> datetime | None:
     if not resets_at:
         return None
-    from datetime import timezone
-    # Handle ISO format with timezone
-    s = resets_at.replace("+00:00", "+0000").replace("Z", "+0000")
     try:
-        # Python 3.11+ handles this natively
         return datetime.fromisoformat(resets_at)
     except Exception:
         return None
@@ -410,7 +417,6 @@ def _parse_reset_time(resets_at: str | None) -> datetime | None:
 def _time_remaining(dt: datetime | None) -> str:
     if not dt:
         return "-"
-    from datetime import timezone
     now = datetime.now(timezone.utc)
     # Make dt timezone-aware if it isn't
     if dt.tzinfo is None:
@@ -430,7 +436,6 @@ def _time_remaining(dt: datetime | None) -> str:
 
 def _pace_indicator(utilization: float, resets_at: str | None, window_hours: float) -> str:
     """Compare usage % to % of window elapsed. Returns a pace indicator."""
-    from datetime import timezone
 
     if utilization == 0:
         return ""
@@ -474,7 +479,6 @@ def _pace_indicator(utilization: float, resets_at: str | None, window_hours: flo
 
 def _billing_info(sub_data: dict) -> tuple[str, str]:
     """Return (next_billing_str, days_until_str)."""
-    from datetime import timezone
     ncd = sub_data.get("next_charge_date")
     if not ncd:
         return ("-", "-")
@@ -489,7 +493,6 @@ def _billing_info(sub_data: dict) -> tuple[str, str]:
 
 def format_summary(results: list[dict]):
     """Print a compact summary table."""
-    from datetime import timezone
 
     rows = []
     for r in results:
@@ -550,7 +553,10 @@ def format_summary(results: list[dict]):
 
     # Print table
     print()
-    hdr = f"{'Account':<20s} {'5hr':>5s} {'resets':>7s} {'7day':>5s} {'resets':>7s} {'pace':>4s} {'sonnet':>6s} {'billing':>10s} {'in':>4s}"
+    hdr = (
+        f"{'Account':<20s} {'5hr':>5s} {'resets':>7s} {'7day':>5s}"
+        f" {'resets':>7s} {'pace':>4s} {'sonnet':>6s} {'billing':>10s} {'in':>4s}"
+    )
     print(hdr)
     print("-" * len(hdr))
 
@@ -616,6 +622,500 @@ def format_detail(results: list[dict]):
     print()
 
 
+# ── Track: append usage snapshot to JSONL history ────────────────────────────
+
+def _extract_usage_snapshot(check_result: dict) -> dict:
+    """Transform a check_fast_sync result into compact usage fields."""
+    if check_result.get("error"):
+        return {"error": check_result["error"]}
+
+    usage_data = None
+    for entry in check_result.get("api_data", []):
+        data = entry.get("data", {})
+        if isinstance(data, dict) and "five_hour" in data:
+            usage_data = data
+            break
+
+    if not usage_data:
+        return {"error": "no usage data"}
+
+    snapshot = {}
+    for window in ("five_hour", "seven_day", "seven_day_sonnet"):
+        w = usage_data.get(window)
+        if w:
+            snapshot[window] = {
+                "utilization": w.get("utilization", 0),
+                "resets_at": w.get("resets_at"),
+            }
+    return snapshot
+
+
+def track_usage(accounts: dict) -> None:
+    """Fetch all accounts and append one JSONL snapshot line."""
+    account_snapshots = {}
+    for aid in sorted(accounts.keys()):
+        name = accounts[aid]["name"]
+        print(f"Checking {name}...", file=sys.stderr)
+        result = check_fast_sync(aid, accounts)
+        account_snapshots[name] = _extract_usage_snapshot(result)
+
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "accounts": account_snapshots,
+    }
+
+    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(HISTORY_FILE, "a") as f:
+        f.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+
+# ── Report: burn rate analysis from history ──────────────────────────────────
+
+def load_history(hours: float = 24.0) -> list[dict]:
+    """Read JSONL history, filter to lookback window."""
+    if not HISTORY_FILE.exists():
+        return []
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    snapshots = []
+    for line in HISTORY_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        try:
+            ts = datetime.fromisoformat(record["ts"])
+        except (KeyError, ValueError):
+            continue
+        if ts >= cutoff:
+            snapshots.append(record)
+    return snapshots
+
+
+def _find_monotonic_segment(
+    points: list[tuple[float, float]], drop_threshold: float = 5.0,
+) -> list[tuple[float, float]]:
+    """Find most recent segment without large drops.
+
+    Walking backwards, if utilization drops by more than drop_threshold
+    between consecutive points (old usage falling off rolling window),
+    truncate to after the drop.
+    """
+    if len(points) < 2:
+        return points
+    # points are sorted by time ascending
+    for i in range(len(points) - 1, 0, -1):
+        if points[i][1] - points[i - 1][1] < -drop_threshold:
+            return points[i:]
+    return points
+
+
+def _linear_regression_slope(
+    points: list[tuple[float, float]],
+) -> float | None:
+    """Least-squares slope in units_y per units_x. Returns None if <2 points."""
+    n = len(points)
+    if n < 2:
+        return None
+    sum_x = sum(p[0] for p in points)
+    sum_y = sum(p[1] for p in points)
+    sum_xy = sum(p[0] * p[1] for p in points)
+    sum_x2 = sum(p[0] ** 2 for p in points)
+    denom = n * sum_x2 - sum_x**2
+    if abs(denom) < 1e-10:
+        return None
+    return (n * sum_xy - sum_x * sum_y) / denom
+
+
+def compute_burn_rate(
+    snapshots: list[dict], account_name: str, window_key: str,
+) -> dict | None:
+    """Compute burn rate for one account+window from history snapshots."""
+    # Extract (hours_since_first, utilization) pairs
+    points_raw = []
+    for snap in snapshots:
+        acct = snap.get("accounts", {}).get(account_name, {})
+        if "error" in acct:
+            continue
+        window = acct.get(window_key, {})
+        util = window.get("utilization")
+        if util is None:
+            continue
+        ts = datetime.fromisoformat(snap["ts"])
+        points_raw.append((ts, util))
+
+    if not points_raw:
+        return None
+
+    # Sort by time
+    points_raw.sort(key=lambda p: p[0])
+
+    # Convert to hours since first snapshot
+    t0 = points_raw[0][0]
+    points = [
+        ((t - t0).total_seconds() / 3600, u)
+        for t, u in points_raw
+    ]
+
+    # Find monotonic segment (handles drops from rolling window)
+    segment = _find_monotonic_segment(points)
+    slope = _linear_regression_slope(segment)
+
+    current_util = points_raw[-1][1]
+    resets_at_str = None
+    # Get resets_at from latest snapshot
+    latest_acct = snapshots[-1].get("accounts", {}).get(
+        account_name, {},
+    )
+    latest_window = latest_acct.get(window_key, {})
+    resets_at_str = latest_window.get("resets_at")
+
+    result = {
+        "account": account_name,
+        "window": window_key,
+        "current": current_util,
+        "slope_per_hour": slope,
+        "data_points": len(segment),
+        "total_points": len(points_raw),
+        "resets_at": resets_at_str,
+    }
+
+    if slope and slope > 0.01:
+        eta_hours = (100 - current_util) / slope
+        result["eta_hours"] = round(eta_hours, 1)
+
+        # Compare to reset time
+        if resets_at_str:
+            reset_dt = _parse_reset_time(resets_at_str)
+            if reset_dt:
+                now = datetime.now(timezone.utc)
+                if reset_dt.tzinfo is None:
+                    reset_dt = reset_dt.replace(
+                        tzinfo=timezone.utc,
+                    )
+                hours_to_reset = (
+                    (reset_dt - now).total_seconds() / 3600
+                )
+                result["hours_to_reset"] = round(
+                    hours_to_reset, 1,
+                )
+                result["will_hit_limit"] = (
+                    eta_hours < hours_to_reset
+                )
+
+    return result
+
+
+def assess_pool_health(report_data: list[dict]) -> dict:
+    """Assess token pool as a whole, accounting for rotation.
+
+    Returns pool-level health with:
+    - available: accounts under 100% weekly
+    - weekly_runway: hours until last available account hits 100%
+    - session_available: accounts under 100% on 5hr window
+    - alert level: ok / warning / critical
+    """
+    weekly = [r for r in report_data if r["window"] == "seven_day"]
+    session = [r for r in report_data if r["window"] == "five_hour"]
+    total = len(weekly)
+
+    # Weekly pool health
+    weekly_available = [r for r in weekly if r["current"] < 100]
+    weekly_capped = total - len(weekly_available)
+
+    # Pool headroom: total remaining capacity across uncapped accounts
+    pool_headroom = sum(100 - r["current"] for r in weekly_available)
+
+    # Active burn rate: max among uncapped accounts (only one burns
+    # at a time due to sequential rotation)
+    active_burn = max(
+        (r.get("slope_per_hour", 0) for r in weekly_available
+         if r.get("slope_per_hour") and r["slope_per_hour"] > 0.01),
+        default=0,
+    )
+
+    # Earliest reset across all accounts (capped ones will free up)
+    earliest_reset_hours = None
+    for r in weekly:
+        h = r.get("hours_to_reset")
+        if h is not None and h > 0:
+            if earliest_reset_hours is None or h < earliest_reset_hours:
+                earliest_reset_hours = h
+
+    # Session pool health
+    session_available = [
+        r for r in session if r["current"] < 100
+    ]
+
+    # Pool runway: headroom / active_burn (sequential rotation)
+    pool_runway = (
+        pool_headroom / active_burn if active_burn > 0.01 else None
+    )
+    # If a capped account resets before the pool is exhausted,
+    # capacity is replenished — runway is effectively infinite
+    if (earliest_reset_hours and pool_runway
+            and earliest_reset_hours < pool_runway):
+        pool_runway = None
+
+    # Determine alert level
+    last_eta = pool_headroom / active_burn if active_burn > 0.01 else None
+    if not weekly_available:
+        alert = "critical"
+        alert_reason = "all accounts at weekly cap"
+    elif len(weekly_available) == 1:
+        if last_eta is not None and last_eta < 2:
+            alert = "critical"
+            alert_reason = (
+                f"last account ({weekly_available[0]['account']})"
+                f" hits cap in ~{last_eta:.0f}h"
+            )
+        else:
+            alert = "warning"
+            alert_reason = (
+                f"only {weekly_available[0]['account']} has"
+                f" weekly headroom"
+            )
+    elif len(weekly_available) == 2 and all(
+        r["current"] > 80 for r in weekly_available
+    ):
+        alert = "warning"
+        alert_reason = (
+            "only 2 accounts left, both above 80%"
+        )
+    elif not session_available:
+        alert = "warning"
+        alert_reason = (
+            "all session caps hit (resolves in <5h)"
+        )
+    else:
+        alert = "ok"
+        alert_reason = (
+            f"{len(weekly_available)}/{total} accounts"
+            f" have weekly headroom"
+        )
+
+    return {
+        "total_accounts": total,
+        "weekly_available": len(weekly_available),
+        "weekly_capped": weekly_capped,
+        "session_available": len(session_available),
+        "session_total": len(session),
+        "active_burn_rate": round(active_burn, 1),
+        "pool_headroom_pct": round(pool_headroom, 1),
+        "pool_runway_hours": (
+            round(pool_runway, 1) if pool_runway else None
+        ),
+        "earliest_reset_hours": (
+            round(earliest_reset_hours, 1)
+            if earliest_reset_hours else None
+        ),
+        "alert": alert,
+        "alert_reason": alert_reason,
+    }
+
+
+def recommend_account(report_data: list[dict]) -> dict | None:
+    """Pick best account by utilization + burn rate."""
+    candidates = []
+    for entry in report_data:
+        if entry.get("window") != "seven_day":
+            continue
+        score = entry["current"]
+        # Penalize high burn rate
+        if entry.get("slope_per_hour") and entry["slope_per_hour"] > 0:
+            score += entry["slope_per_hour"] * 10
+        candidates.append((score, entry))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c[0])
+    best = candidates[0][1]
+    return {
+        "account": best["account"],
+        "utilization": best["current"],
+        "reason": _recommendation_reason(best),
+    }
+
+
+def _recommendation_reason(entry: dict) -> str:
+    util = entry["current"]
+    slope = entry.get("slope_per_hour")
+    if util < 10:
+        return "barely used"
+    elif util < 40:
+        if slope and slope < 0.5:
+            return "low usage, comfortable pace"
+        return "low usage"
+    elif util < 70:
+        return "moderate usage"
+    else:
+        return "high usage but lowest available"
+
+
+def format_report(
+    report_data: list[dict],
+    pool_health: dict,
+    recommendation: dict | None,
+    snapshots: list[dict],
+    hours: float,
+    json_output: bool = False,
+) -> None:
+    """Print burn rate report in human or JSON format."""
+    if json_output:
+        output = {
+            "snapshots": len(snapshots),
+            "hours": hours,
+            "accounts": report_data,
+            "pool": pool_health,
+            "recommendation": recommendation,
+        }
+        print(json.dumps(output, indent=2, default=str))
+        return
+
+    print(
+        f"\nUsage Report"
+        f" (last {hours:.0f}h, {len(snapshots)} snapshots)"
+    )
+    print()
+
+    # Group by account, show seven_day as primary
+    weekly = [r for r in report_data if r["window"] == "seven_day"]
+    if not weekly:
+        print("No data available.")
+        return
+
+    hdr = (
+        f"{'Account':<20s} {'7day':>5s} {'burn':>8s}"
+        f" {'ETA':>7s} {'resets':>8s} {'status':>16s}"
+    )
+    print(hdr)
+    print("\u2500" * len(hdr))
+
+    for r in weekly:
+        name = r["account"]
+        current = f"{r['current']:.0f}%"
+        slope = r.get("slope_per_hour")
+        burn = (
+            f"+{slope:.1f}/hr" if slope and slope > 0.01
+            else "\u2500"
+        )
+        eta = (
+            f"{r['eta_hours']:.1f}h" if "eta_hours" in r
+            else "\u2500"
+        )
+        resets = _time_remaining(
+            _parse_reset_time(r.get("resets_at")),
+        )
+
+        if r["current"] >= 100:
+            status = "capped"
+        elif r.get("will_hit_limit"):
+            status = "\u26a0 will hit limit"
+        else:
+            status = "ok"
+
+        print(
+            f"{name:<20s} {current:>5s} {burn:>8s}"
+            f" {eta:>7s} {resets:>8s} {status:>16s}"
+        )
+
+    # Pool health summary
+    ph = pool_health
+    alert = ph["alert"]
+    icons = {"ok": "\u2713", "warning": "\u26a0", "critical": "\u2716"}
+    icon = icons.get(alert, "?")
+
+    print(f"\nPool: {icon} {ph['alert_reason']}")
+
+    avail = ph["weekly_available"]
+    total = ph["total_accounts"]
+    capped = ph["weekly_capped"]
+    print(
+        f"  Weekly: {avail}/{total} available,"
+        f" {capped} capped"
+    )
+
+    if ph["pool_headroom_pct"] > 0:
+        n_avail = ph["weekly_available"]
+        print(
+            f"  Pool headroom: {ph['pool_headroom_pct']:.0f}%"
+            f" across {n_avail} account{'s' if n_avail != 1 else ''}"
+        )
+
+    if ph["active_burn_rate"] > 0:
+        print(
+            f"  Active burn: +{ph['active_burn_rate']}/hr"
+            f" (sequential rotation)"
+        )
+
+    if ph["pool_runway_hours"] is not None:
+        runway = ph["pool_runway_hours"]
+        print(f"  Runway: ~{runway:.0f}h until all accounts capped")
+
+    if ph["earliest_reset_hours"] is not None:
+        reset_h = ph["earliest_reset_hours"]
+        print(f"  Next reset: {reset_h:.0f}h (replenishes pool)")
+
+    sess = ph["session_available"]
+    sess_total = ph["session_total"]
+    if sess < sess_total:
+        print(
+            f"  Sessions: {sess}/{sess_total}"
+            f" available (5hr caps)"
+        )
+
+    if recommendation:
+        print(
+            f"\nRecommendation: Use"
+            f" {recommendation['account']}"
+            f" ({recommendation['utilization']:.0f}% weekly,"
+            f" {recommendation['reason']})"
+        )
+
+    print()
+
+
+def report_usage(
+    accounts: dict,
+    hours: float = 24.0,
+    json_output: bool = False,
+    account_filter: str | None = None,
+) -> None:
+    """Load history and print burn rate report."""
+    snapshots = load_history(hours)
+    if not snapshots:
+        print(
+            "No history data. Run 'claude-usage track' first.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Determine which accounts to report on
+    if account_filter:
+        account_names = [account_filter]
+    else:
+        # Gather all account names from snapshots
+        names: set[str] = set()
+        for snap in snapshots:
+            names.update(snap.get("accounts", {}).keys())
+        account_names = sorted(names)
+
+    report_data = []
+    for name in account_names:
+        for window in ("seven_day", "five_hour"):
+            result = compute_burn_rate(snapshots, name, window)
+            if result:
+                report_data.append(result)
+
+    pool = assess_pool_health(report_data)
+    rec = recommend_account(report_data)
+    format_report(
+        report_data, pool, rec, snapshots, hours, json_output,
+    )
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -627,6 +1127,8 @@ commands:
   setup      Log in via browser, export session cookies
   discover   Capture API endpoints from usage page
   check      Fast usage check (httpx), or --visible for browser fallback
+  track      Append usage snapshot to JSONL history (for cron)
+  report     Burn rate analysis from history
 """,
     )
     sub = parser.add_subparsers(dest="command")
@@ -638,10 +1140,23 @@ commands:
     # discover
     sub.add_parser("discover", help="Capture API endpoint URLs from the usage page")
 
+    # track
+    sub.add_parser("track", help="Append usage snapshot to history (for cron)")
+
+    # report
+    sp_report = sub.add_parser("report", help="Burn rate analysis from history")
+    sp_report.add_argument(
+        "--hours", type=float, default=24.0, help="Lookback window (default: 24)",
+    )
+    sp_report.add_argument("--json", action="store_true", help="JSON output")
+    sp_report.add_argument("--account", "-a", help="Filter to one account name")
+
     # check
     sp_check = sub.add_parser("check", help="Check usage for accounts")
     sp_check.add_argument("--account", "-a", help="Account number or name (default: all)")
-    sp_check.add_argument("--visible", action="store_true", help="Use browser instead of fast HTTP mode")
+    sp_check.add_argument(
+        "--visible", action="store_true", help="Use browser instead of fast HTTP mode",
+    )
     sp_check.add_argument("--json", action="store_true", help="Output raw JSON")
     sp_check.add_argument("--detail", "-d", action="store_true", help="Show detailed API responses")
 
@@ -664,6 +1179,17 @@ commands:
 
     elif args.command == "discover":
         asyncio.run(discover_all(accounts))
+
+    elif args.command == "track":
+        track_usage(accounts)
+
+    elif args.command == "report":
+        report_usage(
+            accounts,
+            hours=args.hours,
+            json_output=args.json,
+            account_filter=args.account,
+        )
 
     elif args.command == "check":
         if args.account:
