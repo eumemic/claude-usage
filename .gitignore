@@ -1,5 +1,6 @@
 .venv/
 profiles/
 endpoints.json
+data/
 __pycache__/
 *.pyc
